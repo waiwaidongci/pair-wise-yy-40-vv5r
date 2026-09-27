@@ -65,6 +65,52 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS contracts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_no TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    contractor TEXT NOT NULL,
+                    total_quantity REAL NOT NULL,
+                    unit_price REAL NOT NULL,
+                    visa_quantity REAL NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS submissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
+                    period TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    remark TEXT NOT NULL DEFAULT '',
+                    visa_ref TEXT,
+                    status TEXT NOT NULL CHECK(status IN ('pending','approved')),
+                    reasons TEXT NOT NULL DEFAULT '[]',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS payment_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
+                    submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+                    period TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'unpaid'
+                        CHECK(status IN ('unpaid','paid')),
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id INTEGER NOT NULL REFERENCES payment_plans(id) ON DELETE CASCADE,
+                    contract_id INTEGER NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
+                    amount REAL NOT NULL,
+                    paid_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
 
     @staticmethod
@@ -191,6 +237,210 @@ class Repository:
             item["detail"] = json.loads(item["detail"])
             result.append(item)
         return result
+
+    # ---- 施工结算 ----
+    def create_contract(self, contract_no: str, title: str, contractor: str,
+                        total_quantity: float, unit_price: float,
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO contracts(contract_no, title, contractor, total_quantity,
+                       unit_price, visa_quantity, version, created_by, created_at, updated_at)
+                       VALUES(?,?,?,?,?,0,1,?,?,?)""",
+                    (contract_no, title, contractor, total_quantity, unit_price,
+                     actor, now, now),
+                )
+                contract_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("合同编号已存在") from exc
+        return self.get_contract(contract_id)
+
+    def get_contract(self, contract_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM contracts WHERE id=?", (contract_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("合同不存在")
+        return dict(row)
+
+    def list_contracts(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM contracts ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def update_contract(self, contract_id: int, total_quantity: float,
+                        visa_quantity: float, unit_price: float,
+                        expected_version: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE contracts SET total_quantity=?, visa_quantity=?, unit_price=?,
+                   version=version+1, updated_at=? WHERE id=? AND version=?""",
+                (total_quantity, visa_quantity, unit_price, now,
+                 contract_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM contracts WHERE id=?", (contract_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("合同不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+        return self.get_contract(contract_id)
+
+    def create_submission(self, contract_id: int, period: str, quantity: float,
+                          remark: str, visa_ref: Optional[str], status: str,
+                          reasons: List[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO submissions(contract_id, period, quantity, remark, visa_ref,
+                   status, reasons, created_by, created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (contract_id, period, quantity, remark, visa_ref, status,
+                 json.dumps(reasons, ensure_ascii=False), actor, now),
+            )
+            submission_id = int(cur.lastrowid)
+        return self.get_submission(submission_id)
+
+    def get_submission(self, submission_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("报量不存在")
+        return dict(row)
+
+    def list_submissions(self, contract_id: int,
+                         status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM submissions WHERE contract_id=?"
+        params: tuple = (contract_id,)
+        if status:
+            sql += " AND status=?"
+            params = (contract_id, status)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def approved_quantity(self, contract_id: int) -> float:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COALESCE(SUM(quantity),0) AS q FROM submissions
+                   WHERE contract_id=? AND status='approved'""",
+                (contract_id,),
+            ).fetchone()
+        return float(row["q"])
+
+    def submission_periods(self, contract_id: int,
+                           exclude_id: Optional[int] = None) -> List[str]:
+        sql = """SELECT period FROM submissions
+                 WHERE contract_id=? AND status IN ('pending','approved')"""
+        params: tuple = (contract_id,)
+        if exclude_id is not None:
+            sql += " AND id<>?"
+            params = (contract_id, exclude_id)
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [row["period"] for row in rows]
+
+    def update_submission_status(self, submission_id: int, status: str,
+                                 reasons: List[str]) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE submissions SET status=?, reasons=? WHERE id=?",
+                (status, json.dumps(reasons, ensure_ascii=False), submission_id),
+            )
+        return self.get_submission(submission_id)
+
+    def create_payment_plan(self, contract_id: int, submission_id: int, period: str,
+                            quantity: float, amount: float) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO payment_plans(contract_id, submission_id, period, quantity,
+                   amount, status, version, created_at, updated_at)
+                   VALUES(?,?,?,?,?,'unpaid',1,?,?)""",
+                (contract_id, submission_id, period, quantity, amount, now, now),
+            )
+            plan_id = int(cur.lastrowid)
+        return self.get_payment_plan(plan_id)
+
+    def get_payment_plan(self, plan_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM payment_plans WHERE id=?", (plan_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("付款计划不存在")
+        return dict(row)
+
+    def list_payment_plans(self, contract_id: int,
+                           status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM payment_plans WHERE contract_id=?"
+        params: tuple = (contract_id,)
+        if status:
+            sql += " AND status=?"
+            params = (contract_id, status)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def recalc_unpaid_plans(self, contract_id: int, unit_price: float) -> List[int]:
+        now = utc_now()
+        with self._lock, self.conn:
+            rows = self.conn.execute(
+                "SELECT id, quantity FROM payment_plans WHERE contract_id=? AND status='unpaid'",
+                (contract_id,),
+            ).fetchall()
+            ids = []
+            for row in rows:
+                amount = round(float(row["quantity"]) * float(unit_price), 2)
+                self.conn.execute(
+                    """UPDATE payment_plans SET amount=?, version=version+1, updated_at=?
+                       WHERE id=? AND status='unpaid'""",
+                    (amount, now, row["id"]),
+                )
+                ids.append(int(row["id"]))
+        return ids
+
+    def mark_plan_paid(self, plan_id: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE payment_plans SET status='paid', version=version+1, updated_at=?
+                   WHERE id=? AND status='unpaid'""",
+                (now, plan_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM payment_plans WHERE id=?", (plan_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("付款计划不存在")
+                raise ConflictError("该计划已支付")
+        return self.get_payment_plan(plan_id)
+
+    def create_payment(self, plan_id: int, contract_id: int, amount: float,
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO payments(plan_id, contract_id, amount, paid_by, created_at)
+                   VALUES(?,?,?,?,?)""",
+                (plan_id, contract_id, amount, actor, now),
+            )
+            payment_id = int(cur.lastrowid)
+            row = self.conn.execute(
+                "SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+        return dict(row)
+
+    def list_payments(self, contract_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM payments WHERE contract_id=? ORDER BY id",
+                (contract_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def verify_audit_chain(self) -> bool:
         from .audit import calculate_hash

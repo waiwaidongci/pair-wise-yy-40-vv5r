@@ -5,6 +5,7 @@ from pathlib import Path
 from src.http_api import make_handler
 from src.repository import Repository
 from src.service import Service
+from src.settlement_service import SettlementService
 def parse_args():
     parser=argparse.ArgumentParser(description='建筑抗震鉴定与加固排序')
     parser.add_argument("--db",default="./data.db",help="SQLite数据库路径")
@@ -13,7 +14,8 @@ def parse_args():
     return parser.parse_args()
 def main():
     args=parse_args(); repository=Repository(args.db); service=Service(repository)
-    server=ThreadingHTTPServer((args.host,args.port),make_handler(service,str(Path(__file__).resolve().parent/"static")))
+    settlement=SettlementService(repository)
+    server=ThreadingHTTPServer((args.host,args.port),make_handler(service,str(Path(__file__).resolve().parent/"static"),settlement))
     print(f"listening on http://{args.host}:{args.port}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass

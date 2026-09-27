@@ -9,9 +9,11 @@ from urllib.parse import parse_qs, urlparse
 from .domain import (ConflictError, DomainError, NotFoundError, PermissionDenied,
                      ValidationError)
 from .service import Service
+from .settlement_service import SettlementService
 
 
-def make_handler(service: Service, static_dir: str):
+def make_handler(service: Service, static_dir: str,
+                 settlement: Optional[SettlementService] = None):
     root = Path(static_dir)
 
     class Handler(BaseHTTPRequestHandler):
@@ -98,6 +100,21 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/contracts" and settlement is not None:
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"contracts": settlement.list_contracts(role)})
+                elif path.startswith("/api/contracts/") and settlement is not None:
+                    contract_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, settlement.get_contract(contract_id, role))
+                elif path == "/api/settlements" and settlement is not None:
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    contract_id = int(query.get("contract_id", ["0"])[0])
+                    self._json(200, settlement.list_settlements(contract_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +136,21 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/settlements" and settlement is not None:
+                    self._json(201, settlement.submit(body, actor, role))
+                elif (path.startswith("/api/settlements/") and path.endswith("/confirm")
+                      and settlement is not None):
+                    submission_id = int(path.split("/")[3])
+                    self._json(200, settlement.confirm(submission_id, actor, role))
+                elif (path.startswith("/api/contracts/") and path.endswith("/correction")
+                      and settlement is not None):
+                    contract_id = int(path.split("/")[3])
+                    self._json(200, settlement.correct_contract(
+                        contract_id, body, actor, role))
+                elif (path.startswith("/api/payment-plans/") and path.endswith("/pay")
+                      and settlement is not None):
+                    plan_id = int(path.split("/")[3])
+                    self._json(200, settlement.pay_plan(plan_id, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
