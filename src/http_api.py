@@ -11,7 +11,7 @@ from .domain import (ConflictError, DomainError, NotFoundError, PermissionDenied
 from .service import Service
 
 
-def make_handler(service: Service, static_dir: str):
+def make_handler(service: Service, static_dir: str, settlement=None):
     root = Path(static_dir)
 
     class Handler(BaseHTTPRequestHandler):
@@ -98,6 +98,40 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif settlement is not None and path == "/api/settlement/contracts":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"contracts": settlement.list_contracts(role)})
+                elif settlement is not None and path == "/api/settlement/reports":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    contract_id = (int(query["contract_id"][0])
+                                   if "contract_id" in query else None)
+                    status = query.get("status", [None])[0]
+                    self._json(200, {"reports": settlement.list_reports(
+                        role, contract_id, status)})
+                elif settlement is not None and path == "/api/settlement/plans":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    contract_id = (int(query["contract_id"][0])
+                                   if "contract_id" in query else None)
+                    self._json(200, {"plans": settlement.list_plans(role, contract_id)})
+                elif settlement is not None and path == "/api/settlement/payments":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    contract_id = (int(query["contract_id"][0])
+                                   if "contract_id" in query else None)
+                    self._json(200, {"records": settlement.list_payments(role, contract_id)})
+                elif settlement is not None and path == "/api/settlement/summary":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    contract_id = (int(query["contract_id"][0])
+                                   if "contract_id" in query else None)
+                    self._json(200, {"summary": settlement.summary(role, contract_id)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +153,29 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif settlement is not None and path == "/api/settlement/contracts":
+                    self._json(201, settlement.create_contract(body, actor, role))
+                elif settlement is not None and path == "/api/settlement/reports":
+                    self._json(201, settlement.submit_report(body, actor, role))
+                elif settlement is not None and path.startswith("/api/settlement/"):
+                    parts = path.strip("/").split("/")
+                    if len(parts) == 5 and parts[2] == "contracts" and parts[4] == "correct":
+                        self._json(200, settlement.correct_contract(
+                            int(parts[3]), body, actor, role))
+                    elif len(parts) == 5 and parts[2] == "contracts" and parts[4] == "visas":
+                        self._json(201, settlement.add_visa(
+                            int(parts[3]), body, actor, role))
+                    elif len(parts) == 5 and parts[2] == "visas" and parts[4] == "correct":
+                        self._json(200, settlement.correct_visa(
+                            int(parts[3]), body, actor, role))
+                    elif len(parts) == 5 and parts[2] == "reports" and parts[4] == "recheck":
+                        self._json(200, settlement.recheck_report(
+                            int(parts[3]), body, actor, role))
+                    elif len(parts) == 5 and parts[2] == "plans" and parts[4] == "pay":
+                        self._json(200, settlement.pay_plan(
+                            int(parts[3]), body, actor, role))
+                    else:
+                        self._json(404, {"error": "not_found"})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
